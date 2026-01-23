@@ -772,5 +772,33 @@ def main():
     else:
         print("\n⚠️  配信するニュースがありません", flush=True)
 
+def generate_investment_aux_news(stock_id, stock_name, price_context=None):
+    """
+    投資判断補助ニュース（最大1本）を生成する。
+    既存ニュースと同じフォーマットで返すことを前提とする。
+    """
+    title = f"📉 投資判断補助（株価フェーズ整理）"
+
+    summary = (
+        "直近の株価推移と公開情報を整理し、"
+        "現在の株価がどのフェーズにあるかを事実ベースで整理します。"
+    )
+
+    analysis = (
+        "直近の企業ニュースと株価の動きを照合すると、"
+        "短期的な調整・反動、または材料待ちの局面に入っている可能性があります。"
+        "本項目は売買を推奨するものではなく、"
+        "ニュースと株価の位置関係を把握するための補助情報です。"
+    )
+
+    return {
+        "title": title,
+        "summary": summary,
+        "analysis": analysis,
+        "source": "System",
+        "is_aux": True,
+    }
+
+
 if __name__ == "__main__":
     main()
