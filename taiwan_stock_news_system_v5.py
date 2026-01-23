@@ -664,6 +664,12 @@ def main():
         
         # 配信ニュースを準備（クラスタ情報付き）
         delivery_news = prepare_delivery_news(clustering_result, max_clusters=3)
+
+# --- 投資判断補助ニュースを1本だけ追加 ---
+aux_news = generate_investment_aux_news(stock_id, stock_info['name'])
+if aux_news:
+    delivery_news.append(aux_news)
+
         
         print(f"✅ 配信: {len(delivery_news)}クラスタ", flush=True)
         
