@@ -1,0 +1,50 @@
+台湾株ニュース配信システム v5.2-lite-v3 完全凍結バックアップ
+================================================================
+
+【バージョン情報】
+バージョン: v5.2-lite-v3-frozen-20260115-0230
+作成日時: 2026-01-15 02:30
+前バージョン: v5.2-lite-v2-frozen-20260115-0130
+
+【主要な変更点】
+1. 検索期間ポリシーを「2段階フォールバック方式」に変更
+   - 第1段階: 直近7日モード（全銘柄）
+   - 第2段階: 30日フォールバック（ニュース不足銘柄のみ）
+2. 遅れても価値がある類型の判定関数を追加
+   - 業績: 月次營収、法說會、財測、展望、接單、CapEx
+   - 技術・需給: DRAM/NAND/HBM/CoWoS等の価格・需給
+   - 政策: 關稅、管制、補助金、投資審查
+3. 負荷制御の実装
+   - 7日モード: 銘柄あたり最大15件
+   - 30日フォールバック: 銘柄あたり最大10件
+4. ログ表示の改善
+   - 第1段階・第2段階の明示
+   - フォールバック対象銘柄の表示
+   - 最終結果サマリー
+
+【ファイル構成】
+- taiwan_stock_news_system_v5.py (メインスクリプト)
+- email_template_v5.py (メールテンプレート)
+- news_clustering_v51.py (クラスタリングモジュール)
+- delayed_valuable_news.py (遅れても価値がある類型判定モジュール) ★新規
+- stocks.json (銘柄プロファイル)
+- system_config.json (システム設定)
+- FILE_HASHES.txt (ファイルハッシュ検証用)
+- MANIFEST.txt (このファイル)
+
+【実行環境】
+- Python 3.11.0rc1
+- 必要パッケージ: feedparser, python-dateutil, sendgrid, openai
+
+【実行方法】
+export SENDGRID_API_KEY="YOUR_SENDGRID_API_KEY"
+python3 taiwan_stock_news_system_v5.py
+
+【検証方法】
+cd /path/to/extracted/directory
+sha256sum -c FILE_HASHES.txt
+
+【注意事項】
+- このバックアップは完全凍結版です
+- ファイルの修正・再生成は禁止されています
+- ハッシュ検証に失敗した場合は実行を停止してください
