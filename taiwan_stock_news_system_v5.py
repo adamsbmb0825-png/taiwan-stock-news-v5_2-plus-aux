@@ -51,7 +51,10 @@ STATS = {
 def load_stocks():
     """stocks.jsonから銘柄プロファイルを読み込む"""
     try:
-        with open('/home/ubuntu/stocks.json', 'r', encoding='utf-8') as f:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        stocks_path = os.path.join(base_dir, 'stocks.json')
+
+        with open(stocks_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             return data.get('stocks', {})
     except FileNotFoundError:
