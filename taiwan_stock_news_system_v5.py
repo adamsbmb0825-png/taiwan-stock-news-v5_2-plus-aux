@@ -29,8 +29,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from news_clustering_v51 import cluster_news_by_topic, prepare_delivery_news, print_clustering_log
 
-# OpenAI クライアント初期化
-client = OpenAI()
+# OpenAI クライアント初期化（Project対応）
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    project=os.environ["OPENAI_PROJECT_ID"]
+)
 
 # 台湾時間
 TW_TZ = pytz.timezone('Asia/Taipei')
