@@ -22,6 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
          pip install --upgrade pip
+         pip install google
          pip install google-generativeai
          pip install sendgrid
 
