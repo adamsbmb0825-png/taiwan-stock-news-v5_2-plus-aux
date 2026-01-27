@@ -21,10 +21,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-         pip install --upgrade pip
-         pip install google
-         pip install google-generativeai
-         pip install sendgrid
+          pip install --upgrade pip
+          pip install feedparser
+          pip install google
+          pip install google-generativeai
+          pip install sendgrid
 
       - name: Run news script
         env:
