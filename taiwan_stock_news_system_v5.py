@@ -1,175 +1,125 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-台湾株ニュース配信システム v5.3-stable
-- AI API 完全不使用
-- ルールベース判定
-- 投資判断補助ニュース必ず1本生成
-- 無料・定期実行可能
-"""
-
-VERSION = "v5.3-stable-no-ai-202601"
-
 import os
 import feedparser
-import requests
-import json
-import hashlib
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
-# =========================
-# 基本設定
-# =========================
+# =============================
+# 設定（コード内にキーは書かない）
+# =============================
 
-TW_TZ = pytz.timezone("Asia/Taipei")
+TIMEZONE = pytz.timezone("Asia/Taipei")
 
-RSS_FEEDS = [
-    "https://news.google.com/rss/search?q=台積電&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=創見&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=宇瞻&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=廣達&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+STOCKS = [
+    {"code": "2330", "name": "台積電"},
+    {"code": "2451", "name": "創見"},
+    {"code": "8271", "name": "宇瞻"},
+    {"code": "2382", "name": "廣達"},
 ]
 
-KEYWORDS_SCORE = {
-    "營收": 5,
-    "法說": 5,
-    "EPS": 5,
-    "接單": 4,
-    "出貨": 4,
-    "AI": 3,
-    "半導體": 3,
-    "伺服器": 3,
-    "擴產": 4,
-    "下修": -3,
-    "衰退": -4,
-}
+RSS_FEEDS = [
+    "https://www.cnyes.com/rss/news",
+    "https://tw.stock.yahoo.com/rss",
+]
 
-# =========================
-# 銘柄情報
-# =========================
+# =============================
+# Gemini（APIキーは環境変数）
+# =============================
 
-def load_stocks():
-    with open("stocks.json", encoding="utf-8") as f:
-        return json.load(f)["stocks"]
+def gemini_judge_relevance(stock_name, title, summary):
+    """
+    Geminiに「このニュースは株価判断に重要か？」をYes/Noで聞く
+    """
+    import google.generativeai as genai
 
-STOCKS = load_stocks()
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return False
 
-# =========================
-# ニュース収集
-# =========================
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-pro")
 
-def normalize(text):
-    return re.sub(r"\s+", " ", text.lower())
+    prompt = f"""
+以下のニュースが「{stock_name}」の株価判断に重要か？
+Yes か No のみで答えよ。
 
-def score_news(news, stock_name):
-    score = 0
-    text = normalize(news["title"] + " " + news.get("summary", ""))
-    if stock_name.lower() in text:
-        score += 3
-    for k, v in KEYWORDS_SCORE.items():
-        if k.lower() in text:
-            score += v
-    return score
+ニュースタイトル:
+{title}
 
-def collect_news():
-    all_news = []
-    for feed_url in RSS_FEEDS:
-        feed = feedparser.parse(feed_url)
-        for e in feed.entries[:20]:
-            all_news.append({
-                "title": e.title,
-                "link": e.link,
-                "summary": getattr(e, "summary", ""),
-                "published": getattr(e, "published", "")
-            })
-    return all_news
+本文要約:
+{summary}
+"""
 
-# =========================
-# 投資判断補助（必ず1本）
-# =========================
+    try:
+        response = model.generate_content(prompt)
+        return "yes" in response.text.lower()
+    except Exception:
+        return False
 
-def generate_investment_aux(stock_name, news_count):
-    if news_count >= 5:
-        phase = "上昇トレンド継続"
-    elif news_count >= 2:
-        phase = "材料待ち・持ち合い"
-    else:
-        phase = "調整局面・様子見"
 
-    return {
-        "title": "📉 投資判断補助（株価フェーズ整理）",
-        "summary": f"{stock_name}に関する直近ニュース量から判断すると、現在は「{phase}」の可能性が高い局面です。",
-        "analysis": "本項目は売買を推奨するものではなく、ニュース量と方向性を整理する補助情報です。",
-        "is_aux": True,
-    }
+# =============================
+# メール送信（SendGrid）
+# =============================
 
-# =========================
-# メイン処理
-# =========================
+def send_email(html):
+    api_key = os.environ.get("SENDGRID_API_KEY")
+    mail_from = os.environ.get("SENDGRID_FROM")
+    mail_to = os.environ.get("SENDGRID_TO")
 
-def main():
-    print("="*60)
-    print(f"台湾株ニュース配信システム {VERSION}")
-    print("="*60)
+    if not api_key or not mail_from or not mail_to:
+        print("❌ SendGrid 環境変数が不足しています")
+        return
 
-    all_news = collect_news()
-    results = {}
-
-    for stock_id, stock in STOCKS.items():
-        name = stock["name"]
-        print(f"\n📊 {name}（{stock_id}）")
-
-        scored = []
-        for n in all_news:
-            s = score_news(n, name)
-            if s > 0:
-                n["score"] = s
-                scored.append(n)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        delivery_news = scored[:3]
-
-        # 投資判断補助を必ず追加
-        delivery_news.append(generate_investment_aux(name, len(scored)))
-
-        results[stock_id] = {
-            "stock_info": stock,
-            "news": delivery_news
-        }
-
-        print(f"配信: {len(delivery_news)} 本")
-
-    if results:
-        send_email(results)
-    else:
-        print("⚠️ 配信するニュースがありません")
-
-def send_email(results):
-    html = "<h1>台湾株ニュース</h1>"
-    for r in results.values():
-        html += f"<h2>{r['stock_info']['name']}</h2><ul>"
-        for n in r["news"]:
-            html += f"<li>{n['title']}<br>{n.get('summary','')}</li>"
-        html += "</ul>"
-
-    msg = Mail(
-        from_email=os.environ["SENDGRID_FROM"],
-        to_emails=os.environ["SENDGRID_TO"],
-        subject="台湾株ニュース配信",
+    message = Mail(
+        from_email=mail_from,
+        to_emails=mail_to,
+        subject="🇹🇼 台湾株ニュース配信",
         html_content=html
     )
 
-    sg = SendGridAPIClient(os.environ["SENDGRID_API_KEY"])
-    sg.send(msg)
+    sg = SendGridAPIClient(api_key)
+    sg.send(message)
     print("✅ メール送信成功")
+
+
+# =============================
+# メイン処理
+# =============================
+
+def main():
+    print("台湾株ニュース配信システム v5.2 (Gemini版)")
+
+    delivery = []
+
+    for feed_url in RSS_FEEDS:
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries[:20]:
+            title = entry.get("title", "")
+            summary = entry.get("summary", "")
+
+            for stock in STOCKS:
+                if stock["name"] in title:
+                    important = gemini_judge_relevance(
+                        stock["name"], title, summary
+                    )
+                    if important:
+                        delivery.append(f"<li><b>{stock['name']}</b>: {title}</li>")
+
+    if not delivery:
+        print("⚠️ 配信ニュースなし")
+        return
+
+    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    html = f"""
+    <h2>🇹🇼 台湾株ニュース ({now})</h2>
+    <ul>
+    {''.join(delivery)}
+    </ul>
+    """
+
+    send_email(html)
+
 
 if __name__ == "__main__":
     main()
