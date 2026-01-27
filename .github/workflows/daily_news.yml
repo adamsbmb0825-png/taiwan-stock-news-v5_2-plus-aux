@@ -20,12 +20,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install feedparser
-          pip install google
-          pip install google-generativeai
-          pip install sendgrid
+       run: |
+        pip install --upgrade pip
+        pip install feedparser
+        pip install google
+        pip install google-generativeai
+        pip install sendgrid
+        pip install pytz
 
       - name: Run news script
         env:
