@@ -23,7 +23,7 @@ jobs:
         run: |
          pip install --upgrade pip
          pip install google-generativeai
-         pip install sendgrid feedparser python-dateutil pytz requests
+         pip install sendgrid
 
       - name: Run news script
         env:
