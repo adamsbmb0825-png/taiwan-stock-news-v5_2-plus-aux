@@ -21,8 +21,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install feedparser requests python-dateutil pytz sendgrid
+         pip install --upgrade pip
+         pip install google-generativeai
+         pip install sendgrid feedparser python-dateutil pytz requests
 
       - name: Run news script
         env:
