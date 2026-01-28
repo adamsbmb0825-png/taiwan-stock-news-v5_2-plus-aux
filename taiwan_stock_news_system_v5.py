@@ -1,447 +1,570 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-台湾株ニュース配信システム v5 (AI APIゼロ / 無料運用想定)
-- RSSのみでニュース収集（当日→7日→30日フォールバック）
-- 必ず1銘柄1本ニュースを配信（なければ「見つからない」ではなく、30日まで探し切る）
-- 中国語タイトルの上に、日本語タイトル（簡易辞書変換）を付与
-- URLは本文にベタ貼りしない（記事タイトルにハイパーリンク）
-- SendGridでメール送信（SENDGRID_API_KEY / SENDGRID_FROM / SENDGRID_TO）
 
-環境変数（GitHub Actions Secrets推奨）:
-- SENDGRID_API_KEY
-- SENDGRID_FROM
-- SENDGRID_TO
 """
+台湾株ニュース配信システム（Gemini版 / 無料枠前提 / 安定80点）
+要件:
+- 各銘柄 最低1本ニュース保証（見つからない場合でも候補から強制採用）
+- today / weekly / monthly の分類（検索範囲を広げる）
+- 中国語タイトル + 日本語タイトル（上に日本語）
+- URLは本文に生URLを出さず、タイトルにハイパーリンク
+- 重複は「同一URL」「似たタイトル」を抑制
+- Geminiは「1銘柄1回」だけ使用（翻訳+要点+最重要1本選択）
+- Google Cloud Console（課金）不要：GEMINI_API_KEY のみ使用
+"""
+
+VERSION = "v5.2-gemini-free-stable-20260128"
 
 import os
 import re
 import json
 import time
 import hashlib
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
-
 import requests
 import feedparser
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pytz
 from dateutil import parser as date_parser
+
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
-# ============================================================
-# 設定
-# ============================================================
+# Gemini SDK (Google GenAI SDK)
+# pip install google-genai
+from google import genai  # type: ignore
 
-TZ = pytz.timezone("Asia/Taipei")
 
-# RSSソース（無料・比較的安定）
-# ※必要ならここに追加できます（コードを壊しにくい構造にしてあります）
-RSS_FEEDS = [
-    # Yahoo奇摩股市（株式ニュース）
-    "https://tw.stock.yahoo.com/rss",
-    # 經濟日報 (UDN) - 財經
-    "https://money.udn.com/rssfeed/news/1001/5591?ch=money",
-    # 工商時報 - 財經（※フィードが変わる場合あり）
-    "https://ctee.com.tw/feed",
-    # MoneyDJ - 台股（※フィードが変わる場合あり）
-    "https://www.moneydj.com/kmdj/rss/rssfeed.aspx?a=mb010000",
-]
+TW_TZ = pytz.timezone("Asia/Taipei")
 
-# 収集上限（全フィード合計）
-MAX_ENTRIES_TOTAL = 800
+# ==========================
+# 環境変数（必須）
+# ==========================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 
-# タイムウィンドウ（当日→7日→30日）
-WINDOWS = [
-    ("today", 1),
-    ("weekly", 7),
-    ("monthly", 30),
-]
+EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip()  # 送信元（SendGridで認証済みが推奨）
+EMAIL_TO = os.getenv("EMAIL_TO", "").strip()      # 送信先（自分のGmailなど）
 
-# リクエスト設定
-HTTP_TIMEOUT = 12
-HTTP_RETRIES = 2
+# 任意: 追加の送信先（カンマ区切り）
+EMAIL_TO_CC = os.getenv("EMAIL_TO_CC", "").strip()
 
-# ============================================================
-# 日本語化（無料＆安定のため「簡易辞書＋整形」）
-# ============================================================
+# Geminiモデル（無料枠で使いやすい軽量系）
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
 
-CN2JP_DICT = [
-    # 会社/市場/金融
-    (r"台積電", "TSMC（台積電）"),
-    (r"台股", "台湾株"),
-    (r"美股", "米国株"),
-    (r"財報", "決算"),
-    (r"營收", "売上"),
-    (r"獲利", "利益"),
-    (r"毛利率", "粗利益率"),
-    (r"淨利", "純利益"),
-    (r"法說會", "決算説明会"),
-    (r"股價", "株価"),
-    (r"股價走勢", "株価推移"),
-    (r"目標價", "目標株価"),
-    (r"上漲", "上昇"),
-    (r"下跌", "下落"),
-    (r"大跌", "急落"),
-    (r"大漲", "急騰"),
-    (r"利多", "好材料"),
-    (r"利空", "悪材料"),
-    (r"外資", "海外投資家"),
-    (r"投信", "投資信託"),
-    (r"自營商", "自己売買"),
-    (r"買超", "買い越し"),
-    (r"賣超", "売り越し"),
-    (r"ETF", "ETF"),
-    (r"AI", "AI"),
-    (r"伺服器", "サーバー"),
-    (r"供應鏈", "サプライチェーン"),
-    (r"半導體", "半導体"),
-    (r"記憶體", "メモリ"),
-    (r"DRAM", "DRAM"),
-    (r"NAND", "NAND"),
-    (r"筆電", "ノートPC"),
-    (r"資料中心", "データセンター"),
-    (r"雲端", "クラウド"),
-    (r"訂單", "受注"),
-    (r"出貨", "出荷"),
-    (r"產能", "生産能力"),
-    (r"擴產", "増産"),
-    (r"減產", "減産"),
-    (r"美元", "米ドル"),
-    (r"新台幣", "台湾ドル"),
-    # よくある記号/表記
-    (r"【", "["),
-    (r"】", "]"),
-]
-
-def cn_title_to_jp(title_cn: str) -> str:
-    """無料で安定させるため、翻訳ではなく“日本語化（置換＋整形）”に留める"""
-    if not title_cn:
-        return ""
-    t = title_cn.strip()
-    for pat, rep in CN2JP_DICT:
-        t = re.sub(pat, rep, t)
-    # 余計なスペース整形
-    t = re.sub(r"\s+", " ", t).strip()
-    # それでも中国語が強い場合は頭にラベルを付ける
-    # （完全翻訳はしない）
-    return f"（日本語要約）{t}"
-
-# ============================================================
-# ユーティリティ
-# ============================================================
-
-def now_taipei() -> datetime:
-    return datetime.now(TZ)
-
-def normalize_url(url: str) -> str:
-    if not url:
-        return ""
-    return url.strip()
-
-def safe_domain(url: str) -> str:
+# ==========================
+# 銘柄データ読み込み
+# ==========================
+def load_stocks():
+    """
+    同一ディレクトリの stocks.json を読む。
+    形式:
+    { "stocks": { "2330": {"name":"台積電","business_type":"..."}, ... } }
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base_dir, "stocks.json")
     try:
-        return urlparse(url).netloc or ""
-    except Exception:
-        return ""
-
-def hash_key(*parts: str) -> str:
-    raw = "||".join([p or "" for p in parts])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-def parse_entry_datetime(entry) -> datetime | None:
-    # feedparserはentry.published_parsed / updated_parsed 等を持つことが多い
-    for key in ["published", "updated", "created"]:
-        if hasattr(entry, key):
-            try:
-                dt = date_parser.parse(getattr(entry, key))
-                if dt.tzinfo is None:
-                    dt = TZ.localize(dt)
-                else:
-                    dt = dt.astimezone(TZ)
-                return dt
-            except Exception:
-                pass
-    # structured time
-    for key in ["published_parsed", "updated_parsed"]:
-        if hasattr(entry, key):
-            try:
-                st = getattr(entry, key)
-                if st:
-                    dt = datetime(*st[:6], tzinfo=pytz.utc).astimezone(TZ)
-                    return dt
-            except Exception:
-                pass
-    return None
-
-def http_get(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; TaiwanStockNewsBot/1.0; +https://github.com/)",
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-    }
-    last_err = None
-    for _ in range(HTTP_RETRIES + 1):
-        try:
-            r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_err = e
-            time.sleep(0.8)
-    raise RuntimeError(f"fetch failed: {url} / {last_err}")
-
-def load_stocks() -> list[dict]:
-    """
-    stocks.json 例:
-    [
-      {"name":"台積電","code":"2330","keywords":["台積電","TSMC","2330"]},
-      ...
-    ]
-    """
-    # 優先：同ディレクトリのstocks.json
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "stocks.json")
-
-    if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list) and data:
-                return data
+        return data.get("stocks", {})
+    except Exception as e:
+        print(f"❌ stocks.json 読み込み失敗: {e}", flush=True)
+        return {}
 
-    # フォールバック（最低限）
-    return [
-        {"name": "台積電", "code": "2330", "keywords": ["台積電", "TSMC", "2330"]},
-        {"name": "創見", "code": "2451", "keywords": ["創見", "Transcend", "2451"]},
-        {"name": "宇瞻", "code": "8271", "keywords": ["宇瞻", "Apacer", "8271"]},
-        {"name": "廣達", "code": "2382", "keywords": ["廣達", "Quanta", "2382"]},
+STOCKS = load_stocks()
+
+
+# ==========================
+# RSSフィード（必要ならここで増やせる）
+# ==========================
+RSS_FEEDS = [
+    # --- stock direct ---
+    "https://news.google.com/rss/search?q=台積電+OR+TSMC&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=TSMC&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=TSMC&hl=ja&gl=JP&ceid=JP:ja",
+
+    "https://news.google.com/rss/search?q=創見+OR+Transcend&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=創見+OR+Transcend&hl=ja&gl=JP&ceid=JP:ja",
+
+    "https://news.google.com/rss/search?q=宇瞻+OR+Apacer&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=Apacer&hl=en-US&gl=US&ceid=US:en",
+
+    "https://news.google.com/rss/search?q=廣達+OR+Quanta&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=Quanta+Computer&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=廣達+OR+Quanta&hl=ja&gl=JP&ceid=JP:ja",
+
+    # --- driver queries ---
+    "https://news.google.com/rss/search?q=AI伺服器&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=NVIDIA&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=GB200&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=HBM&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=DRAM價格&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=半導體&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=ODM&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+
+    # --- earnings/event ---
+    "https://news.google.com/rss/search?q=台積電+營收&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=創見+營收&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=宇瞻+營收&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=廣達+營收&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+]
+
+SNS_DOMAINS = [
+    "threads.net", "instagram.com", "line.me", "linkedin.com",
+    "tiktok.com", "youtube.com", "youtu.be", "facebook.com", "x.com", "twitter.com"
+]
+
+
+# ==========================
+# ユーティリティ
+# ==========================
+def is_sns_domain(url: str) -> bool:
+    u = (url or "").lower()
+    return any(d in u for d in SNS_DOMAINS)
+
+def clean_url(url: str) -> str:
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    exclude_params = [
+        "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+        "fbclid","gclid","msclkid","oc","_ga","_gl"
     ]
+    clean_params = {k: v for k, v in query_params.items() if k not in exclude_params}
+    clean_query = urlencode(clean_params, doseq=True)
+    return urlunparse(parsed._replace(query=clean_query))
 
-def collect_rss_entries() -> list[dict]:
-    """
-    RSS全体から記事候補を集める。
-    返り値: [{"title":..., "link":..., "dt":..., "source":...}, ...]
-    """
-    out = []
+def resolve_final_url(url: str, timeout: int = 3) -> str | None:
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=timeout)
+        return clean_url(r.url)
+    except Exception:
+        return None
+
+def normalize_text(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def signature_for_item(title: str, final_url: str) -> str:
+    base = f"{normalize_text(title)}|{final_url}"
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
+
+def parse_pub_date(entry) -> datetime | None:
+    pub_date = None
+    if hasattr(entry, "published"):
+        try:
+            pub_date = date_parser.parse(entry.published).astimezone(TW_TZ)
+        except Exception:
+            pub_date = None
+    return pub_date
+
+def safe_get_publisher(entry, final_url: str) -> str:
+    # RSS source title
+    try:
+        if hasattr(entry, "source") and hasattr(entry.source, "title") and entry.source.title:
+            return str(entry.source.title)
+    except Exception:
+        pass
+    # domain fallback
+    try:
+        d = urlparse(final_url).netloc.replace("www.", "")
+        return d
+    except Exception:
+        return "unknown"
+
+
+# ==========================
+# RSS収集
+# ==========================
+def process_rss_entry(entry) -> dict | None:
+    rss_url = entry.get("link", "")
+    title = entry.get("title", "")
+    snippet = (entry.get("summary", "") or "")[:240]
+
+    final_url = resolve_final_url(rss_url, timeout=3)
+    if not final_url:
+        return None
+    if is_sns_domain(final_url):
+        return None
+
+    pub_date = parse_pub_date(entry)
+    publisher = safe_get_publisher(entry, final_url)
+
+    sig = signature_for_item(title, final_url)
+
+    return {
+        "title_zh": title,
+        "snippet": snippet,
+        "publisher": publisher,
+        "published": pub_date.isoformat() if pub_date else None,
+        "link": final_url,
+        "signature": sig,
+    }
+
+def collect_news_parallel(max_entries_per_feed: int = 20) -> list[dict]:
+    print("📰 RSSフィードからニュース収集中...", flush=True)
+    all_entries = []
+
     for feed_url in RSS_FEEDS:
         try:
-            xml = http_get(feed_url)
-            parsed = feedparser.parse(xml)
-            for e in parsed.entries[:200]:
-                title = (getattr(e, "title", "") or "").strip()
-                link = normalize_url(getattr(e, "link", "") or "")
-                dt = parse_entry_datetime(e)
-                if not title or not link:
-                    continue
-                out.append({
-                    "title": title,
-                    "link": link,
-                    "dt": dt,  # Noneあり
-                    "source": safe_domain(feed_url) or safe_domain(link) or "rss",
-                })
-        except Exception as ex:
-            print(f"⚠️ RSS取得失敗: {feed_url} / {ex}", flush=True)
+            feed = feedparser.parse(feed_url)
+            all_entries.extend(feed.entries[:max_entries_per_feed])
+        except Exception as e:
+            print(f"⚠️ RSS収集エラー: {feed_url} - {e}", flush=True)
 
-    # 重複除外（title+link）
+    print(f"  RSS収集完了: {len(all_entries)}件", flush=True)
+
+    items: list[dict] = []
     seen = set()
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = [ex.submit(process_rss_entry, ent) for ent in all_entries]
+        for i, fut in enumerate(as_completed(futures), 1):
+            if i % 100 == 0:
+                print(f"  処理中: {i}/{len(all_entries)}件", flush=True)
+            try:
+                it = fut.result()
+                if not it:
+                    continue
+                if it["signature"] in seen:
+                    continue
+                seen.add(it["signature"])
+                items.append(it)
+            except Exception:
+                continue
+
+    print(f"✅ 重複除外後: {len(items)}件", flush=True)
+    return items
+
+
+# ==========================
+# 検索範囲の段階拡張
+# today / weekly / monthly
+# ==========================
+def within_days(pub_iso: str | None, days: int) -> bool:
+    if not pub_iso:
+        return False
+    try:
+        d = datetime.fromisoformat(pub_iso)
+        if d.tzinfo is None:
+            d = TW_TZ.localize(d)
+        return d >= (datetime.now(TW_TZ) - timedelta(days=days))
+    except Exception:
+        return False
+
+def stock_keywords(stock_id: str, stock_info: dict) -> list[str]:
+    kws = [stock_info.get("name",""), stock_id]
+    # よくある英名
+    name = stock_info.get("name","")
+    if stock_id == "2330":
+        kws += ["TSMC", "台積電", "tsmc"]
+    if stock_id == "2451":
+        kws += ["Transcend", "創見", "transcend"]
+    if stock_id == "8271":
+        kws += ["Apacer", "宇瞻", "apacer"]
+    if stock_id == "2382":
+        kws += ["Quanta", "廣達", "quanta", "Quanta Computer"]
+    # 空要素除去
+    return [k for k in kws if k]
+
+def pick_candidates_for_stock(all_news: list[dict], stock_id: str, stock_info: dict) -> list[dict]:
+    kws = stock_keywords(stock_id, stock_info)
+
+    # まずキーワードヒット
+    candidates = []
+    for n in all_news:
+        text = f"{n.get('title_zh','')} {n.get('snippet','')}"
+        if any(kw in text for kw in kws):
+            candidates.append(n)
+
+    # もし少なすぎるなら業界ワードも許可（補助）
+    if len(candidates) < 5:
+        bt = (stock_info.get("business_type") or "").strip()
+        if bt:
+            for n in all_news:
+                if n in candidates:
+                    continue
+                text = f"{n.get('title_zh','')} {n.get('snippet','')}"
+                if bt[:6] and bt[:6] in text:
+                    candidates.append(n)
+
+    # 日付が新しい順
+    def sort_key(n):
+        p = n.get("published")
+        try:
+            return datetime.fromisoformat(p) if p else datetime(1970,1,1, tzinfo=TW_TZ)
+        except Exception:
+            return datetime(1970,1,1, tzinfo=TW_TZ)
+
+    candidates.sort(key=sort_key, reverse=True)
+
+    # 同じドメイン・似たタイトルが連続するのを軽く抑制
     dedup = []
-    for item in out:
-        k = hash_key(item["title"], item["link"])
-        if k in seen:
+    seen_title = set()
+    for n in candidates:
+        t = normalize_text(n.get("title_zh",""))
+        # ざっくり近似（先頭40文字）
+        key = t[:40]
+        if key in seen_title:
             continue
-        seen.add(k)
-        dedup.append(item)
+        seen_title.add(key)
+        dedup.append(n)
+        if len(dedup) >= 20:
+            break
 
-    # 新しい順（dtがNoneは最後）
-    def sort_key(x):
-        return x["dt"] if x["dt"] else datetime(1970, 1, 1, tzinfo=TZ)
-    dedup.sort(key=sort_key, reverse=True)
+    return dedup
 
-    # 上限
-    return dedup[:MAX_ENTRIES_TOTAL]
+def split_by_recency(cands: list[dict]) -> dict:
+    today = [c for c in cands if within_days(c.get("published"), 1)]
+    weekly = [c for c in cands if within_days(c.get("published"), 7)]
+    monthly = [c for c in cands if within_days(c.get("published"), 30)]
+    return {"today": today, "weekly": weekly, "monthly": monthly}
 
-def within_days(dt: datetime | None, days: int) -> bool:
-    if dt is None:
-        # 日付が取れないRSSもあるため、除外しない（ただし優先度は下がる）
-        return True
-    return dt >= (now_taipei() - timedelta(days=days))
 
-def match_stock(item: dict, stock: dict) -> bool:
-    title = (item.get("title") or "")
-    # keyword一致（タイトルだけ）
-    for kw in stock.get("keywords", []):
-        if kw and kw in title:
-            return True
-    return False
+# ==========================
+# Gemini（1銘柄1回）で「最重要1本」+「日本語」+「要点」
+# ==========================
+def gemini_client():
+    # GEMINI_API_KEY は環境変数から自動取得されるが、明示指定も可能
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        return genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        return None
 
-def pick_best_news_for_stock(entries: list[dict], stock: dict) -> dict | None:
-    """
-    today→weekly→monthly の順で探索。
-    その中で最も新しいものを採用。
-    """
-    for label, days in WINDOWS:
-        candidates = [it for it in entries if within_days(it["dt"], days) and match_stock(it, stock)]
-        if candidates:
-            # dtがNoneの場合は末尾に回す
-            candidates.sort(
-                key=lambda x: x["dt"] if x["dt"] else datetime(1970, 1, 1, tzinfo=TZ),
-                reverse=True
-            )
-            best = candidates[0].copy()
-            best["bucket"] = label
-            return best
-    return None
+def build_gemini_prompt(stock_id: str, stock_name: str, bucket: str, items: list[dict]) -> str:
+    lines = []
+    for i, n in enumerate(items, 1):
+        pub = n.get("published") or ""
+        lines.append(
+            f"[{i}] {n.get('title_zh','')}\n"
+            f"出典: {n.get('publisher','')}\n"
+            f"日時: {pub}\n"
+            f"概要: {n.get('snippet','')}\n"
+            f"URL: {n.get('link','')}\n"
+        )
 
-def investment_helper_block() -> list[str]:
-    # 固定で毎回付ける（質保証）
-    return [
-        "市場は様子見フェーズ",
-        "短期は材料・反応を確認",
-        "中長期は押し目監視",
-    ]
+    body = "\n\n".join(lines)
 
-def build_email_html(results: list[dict]) -> str:
-    sent_at = now_taipei().strftime("%Y-%m-%d %H:%M")
+    return f"""以下は台湾株ニュース候補です。
 
-    # 以前の「カード型」寄せ（シンプルHTML）
-    def card(title: str, body_html: str) -> str:
-        return f"""
-        <div style="border:1px solid #2b2b2b;border-radius:12px;padding:14px;margin:14px 0;background:#111;">
-          <div style="font-size:18px;font-weight:700;margin-bottom:10px;color:#fff;">{title}</div>
-          <div style="font-size:14px;line-height:1.65;color:#d6d6d6;">{body_html}</div>
-        </div>
-        """
+【銘柄】{stock_name}（{stock_id}）
+【カテゴリ】{bucket}（today/weekly/monthly）
 
-    cards = []
+【目的】
+- 日本人投資家向けに「投資判断に有用な最重要1本」を1つだけ選ぶ
+- 自然で読みやすい日本語タイトルを付ける（中国語原文の上に表示する想定）
+- 要点を3つに絞る（推測しない、原文の範囲で）
 
-    header = f"""
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,'Noto Sans JP','Hiragino Kaku Gothic ProN','Yu Gothic',sans-serif;background:#0b0b0b;color:#fff;padding:18px;">
-      <div style="font-size:34px;font-weight:800;margin:0 0 6px 0;">📈 台湾株ニュース配信</div>
-      <div style="color:#cfcfcf;font-size:14px;">配信日時：{sent_at}</div>
-      <hr style="border:0;border-top:1px solid #2b2b2b;margin:14px 0;">
-    """
+【出力形式】※JSONのみ、前後に文章を付けない
+{{
+  "picked_index": 1,
+  "title_ja": "日本語タイトル（自然）",
+  "title_zh": "原文タイトル（そのまま）",
+  "bullets": ["要点1","要点2","要点3"],
+  "why_this": "なぜ重要か（1文、事実ベース）"
+}}
 
-    for r in results:
-        stock_name = r["stock"]["name"]
-        stock_code = r["stock"]["code"]
-        news = r.get("news")
+【注意】
+- 数値や事実は原文に基づく
+- 断定しすぎない（可能性/見通し等は原文がそう述べる場合のみ）
+- 3〜4行に収まる粒度
 
-        if news:
-            title_cn = news["title"]
-            title_jp = cn_title_to_jp(title_cn)
-            link = news["link"]
-            source = news.get("source", "rss")
-            dt = news.get("dt")
-            dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "日時不明"
-            bucket = news.get("bucket", "today")
+【ニュース候補】
+{body}
+"""
 
-            # タイトルをリンク化（URLのベタ貼り禁止）
-            # 2行構成：日本語（上）→中国語（下）
-            body = f"""
-            <div style="margin-bottom:10px;">
-              <div style="font-weight:700;color:#9fd1ff;margin-bottom:4px;">
-                <a href="{link}" style="color:#7db7ff;text-decoration:none;">{title_jp}</a>
-              </div>
-              <div style="color:#b8b8b8;">
-                <a href="{link}" style="color:#7db7ff;text-decoration:none;">{title_cn}</a>
-              </div>
-              <div style="color:#8a8a8a;font-size:12px;margin-top:6px;">
-                分類：{bucket} / 出典：{source} / 日時：{dt_str}
-              </div>
-            </div>
-            """
-        else:
-            # 「絶対1本」が要求なので、ここは基本到達しない想定。
-            body = f"""
-            <div style="color:#ffb3b3;font-weight:700;margin-bottom:8px;">⚠️ 30日以内でも該当ニュースを抽出できませんでした。</div>
-            <div style="color:#b8b8b8;">検索条件（銘柄キーワード）を要見直し。</div>
-            """
+def gemini_pick_one(stock_id: str, stock_name: str, bucket: str, items: list[dict]) -> dict | None:
+    client = gemini_client()
+    if not client:
+        return None
 
-        helper = investment_helper_block()
-        helper_html = "<ul style='margin:8px 0 0 18px;'>" + "".join([f"<li>{h}</li>" for h in helper]) + "</ul>"
-
-        body += f"""
-        <div style="margin-top:12px;padding-top:10px;border-top:1px solid #2b2b2b;">
-          <div style="font-weight:800;color:#b6ffcc;">📊 投資判断補助（株価フェーズ整理）</div>
-          {helper_html}
-        </div>
-        """
-
-        cards.append(card(f"{stock_name}（{stock_code}）", body))
-
-    footer = """
-      <hr style="border:0;border-top:1px solid #2b2b2b;margin:18px 0 10px;">
-      <div style="color:#8a8a8a;font-size:12px;line-height:1.6;">
-        ※本メールはRSS情報をもとに自動生成しています。投資判断はご自身の責任でお願いします。
-      </div>
-    </div>
-    """
-
-    return header + "\n".join(cards) + footer
-
-def send_email(html: str) -> None:
-    api_key = os.environ.get("SENDGRID_API_KEY", "").strip()
-    mail_from = os.environ.get("SENDGRID_FROM", "").strip()
-    mail_to = os.environ.get("SENDGRID_TO", "").strip()
-
-    if not api_key or not mail_from or not mail_to:
-        print("❌ SendGrid 環境変数が不足しています（SENDGRID_API_KEY / SENDGRID_FROM / SENDGRID_TO）", flush=True)
-        return
-
-    subject = "📈 台湾株ニュース配信"
-    message = Mail(
-        from_email=mail_from,
-        to_emails=mail_to,
-        subject=subject,
-        html_content=html
-    )
+    prompt = build_gemini_prompt(stock_id, stock_name, bucket, items)
 
     try:
-        sg = SendGridAPIClient(api_key)
-        resp = sg.send(message)
-        print(f"✅ メール送信成功 (status={resp.status_code})", flush=True)
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        text = (resp.text or "").strip()
+        # JSONだけ取り出す
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group())
+        return data
     except Exception as e:
-        print(f"❌ メール送信失敗: {e}", flush=True)
+        print(f"⚠️ Gemini失敗: {stock_name} - {e}", flush=True)
+        return None
+
+
+# ==========================
+# 投資判断補助（AIなし・固定）
+# ==========================
+def investment_aux_text(stock_name: str) -> dict:
+    return {
+        "title_ja": "📉 投資判断補助（株価フェーズ整理）",
+        "title_zh": "",
+        "bullets": [
+            "ニュース（材料）の有無と、値動きの大きさは一致しないことがあります。",
+            "短期の上下は“需給/地合い/利益確定”でも起きるため、材料の質を優先して整理します。",
+            "本メールは売買推奨ではなく、確認すべき論点の棚卸しです。"
+        ],
+        "why_this": f"{stock_name}の当日情報を“確認用のメモ”として付与しています。",
+        "link": None,
+        "publisher": "System",
+        "published": datetime.now(TW_TZ).isoformat(),
+        "bucket": "aux",
+        "is_aux": True,
+    }
+
+
+# ==========================
+# 1銘柄ぶん組み立て（最低1本保証）
+# ==========================
+def build_one_stock_result(stock_id: str, stock_info: dict, all_news: list[dict]) -> dict:
+    name = stock_info.get("name", stock_id)
+    print("="*60, flush=True)
+    print(f"📊 {name}（{stock_id}）", flush=True)
+    print("="*60, flush=True)
+
+    cands = pick_candidates_for_stock(all_news, stock_id, stock_info)
+    print(f"候補ニュース: {len(cands)}件", flush=True)
+
+    buckets = split_by_recency(cands)
+
+    # 探す順：today → weekly → monthly → それでもダメなら cands先頭（強制）
+    chosen_bucket = None
+    chosen_list = None
+    for b in ["today", "weekly", "monthly"]:
+        if buckets[b]:
+            chosen_bucket = b
+            chosen_list = buckets[b]
+            break
+
+    if not chosen_list and cands:
+        chosen_bucket = "monthly"
+        chosen_list = cands  # 強制候補（>30日が混ざる可能性はあるが「空よりマシ」）
+    if not chosen_list:
+        # ここまで来るのは異常（RSS取れてない等）
+        # 空でも最低1本要求なのでダミーを出す
+        chosen_bucket = "monthly"
+        chosen_list = [{
+            "title_zh": f"{name} 関連ニュースが取得できませんでした（RSS/ネットワーク要確認）",
+            "snippet": "RSS取得やネットワーク制限により候補が0件でした。",
+            "publisher": "System",
+            "published": datetime.now(TW_TZ).isoformat(),
+            "link": None,
+            "signature": hashlib.md5(f"{stock_id}-{time.time()}".encode()).hexdigest()
+        }]
+
+    # Geminiに投げる候補は上位10件
+    shortlist = chosen_list[:10]
+
+    gem = gemini_pick_one(stock_id, name, chosen_bucket, shortlist)
+    if gem:
+        idx = int(gem.get("picked_index", 1)) - 1
+        idx = max(0, min(idx, len(shortlist)-1))
+        picked = shortlist[idx]
+        news_item = {
+            "title_ja": gem.get("title_ja", picked.get("title_zh", "")),
+            "title_zh": gem.get("title_zh", picked.get("title_zh", "")),
+            "bullets": gem.get("bullets", [])[:3],
+            "why_this": gem.get("why_this", ""),
+            "link": picked.get("link"),
+            "publisher": picked.get("publisher"),
+            "published": picked.get("published"),
+            "bucket": chosen_bucket,
+            "is_aux": False,
+        }
+        print(f"✅ 採用: {chosen_bucket} / Gemini選定", flush=True)
+    else:
+        # Gemini失敗時のフォールバック（最低品質保証）
+        picked = shortlist[0]
+        news_item = {
+            "title_ja": picked.get("title_zh", ""),  # 翻訳できないので同文
+            "title_zh": picked.get("title_zh", ""),
+            "bullets": [picked.get("snippet", "")[:60] + "…"],
+            "why_this": "Geminiが利用できないため、候補の先頭を採用しました。",
+            "link": picked.get("link"),
+            "publisher": picked.get("publisher"),
+            "published": picked.get("published"),
+            "bucket": chosen_bucket,
+            "is_aux": False,
+        }
+        print(f"⚠️ 採用: {chosen_bucket} / Gemini未使用（フォールバック）", flush=True)
+
+    # 1銘柄 = [ニュース1本] + [投資判断補助1本]
+    # ※「必ずニュース1本」の要件を満たしつつ、補助は常に追加
+    out = {
+        "stock_id": stock_id,
+        "stock_name": name,
+        "business_type": stock_info.get("business_type", ""),
+        "items": [news_item, investment_aux_text(name)],
+    }
+    return out
+
+
+# ==========================
+# メール送信
+# ==========================
+def send_email(render_data: list[dict], now_taipei: datetime):
+    if not SENDGRID_API_KEY:
+        print("❌ SENDGRID_API_KEY が未設定です", flush=True)
+        return
+    if not EMAIL_FROM or not EMAIL_TO:
+        print("❌ EMAIL_FROM / EMAIL_TO が未設定です", flush=True)
+        return
+
+    from email_template_v5 import generate_html_email  # ローカルファイル
+
+    html_content = generate_html_email(render_data, now_taipei, VERSION)
+
+    to_list = [EMAIL_TO]
+    cc_list = []
+    if EMAIL_TO_CC:
+        cc_list = [x.strip() for x in EMAIL_TO_CC.split(",") if x.strip()]
+
+    message = Mail(
+        from_email=EMAIL_FROM,
+        to_emails=to_list,
+        subject=f"🇹🇼 台湾株ニュース配信 {VERSION} - {now_taipei.strftime('%Y-%m-%d %H:%M')}",
+        html_content=html_content
+    )
+    if cc_list:
+        message.add_cc(cc_list)
+
+    try:
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        resp = sg.send(message)
+        print(f"✅ メール送信成功（ステータス: {resp.status_code}）", flush=True)
+    except Exception as e:
+        print(f"❌ メール送信エラー: {e}", flush=True)
+
 
 def main():
-    print("=" * 60)
-    print("台湾株ニュース配信システム v5（AI APIゼロ / RSS運用）")
-    print("=" * 60, flush=True)
+    print("="*60, flush=True)
+    print(f"台湾株ニュース配信システム {VERSION}", flush=True)
+    print("="*60, flush=True)
 
-    stocks = load_stocks()
-    print(f"銘柄数: {len(stocks)}", flush=True)
+    if not STOCKS:
+        print("❌ stocks.json の銘柄が空です。stocks.json を確認してください。", flush=True)
+        return
 
-    print("📰 RSSフィードからニュース収集中...", flush=True)
-    entries = collect_rss_entries()
-    print(f"✅ 収集完了: {len(entries)}件（重複除外後）", flush=True)
+    # RSS収集（広めに取って、銘柄側で today/weekly/monthly に分類）
+    all_news = collect_news_parallel(max_entries_per_feed=30)
 
-    results = []
-    for s in stocks:
-        print("-" * 60)
-        print(f"📊 {s['name']}（{s['code']}）", flush=True)
-        news = pick_best_news_for_stock(entries, s)
+    results: list[dict] = []
+    for sid, sinfo in STOCKS.items():
+        results.append(build_one_stock_result(sid, sinfo, all_news))
 
-        # 「必ず1銘柄1本」を最優先：30日でも取れない場合は“タイトル未確定の代替”を作る
-        if not news:
-            # 代替：キーワード無しでも、直近の“台湾株関連っぽい”を拾う（最後の安全網）
-            # ここで0本のまま送るのを防ぐ
-            fallback = None
-            for it in entries:
-                if within_days(it["dt"], 30):
-                    # 台湾株/半導体/サーバー/AIなど一般ワードで拾う
-                    if re.search(r"(台股|半導體|伺服器|AI|財報|營收|外資|ETF|台積電|TSMC)", it["title"]):
-                        fallback = it.copy()
-                        fallback["bucket"] = "monthly"
-                        break
-            news = fallback
+    now_taipei = datetime.now(TW_TZ)
+    print("\n📧 メール送信中...", flush=True)
+    send_email(results, now_taipei)
 
-        if news:
-            print(f"✅ 採用: {news.get('bucket','?')} / {news['title']}", flush=True)
-        else:
-            print("⚠️ 採用ニュースなし（極めて稀）", flush=True)
-
-        results.append({"stock": s, "news": news})
-
-    html = build_email_html(results)
-    send_email(html)
 
 if __name__ == "__main__":
     main()
