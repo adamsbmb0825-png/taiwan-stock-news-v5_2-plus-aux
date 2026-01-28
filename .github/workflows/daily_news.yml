@@ -26,6 +26,8 @@ jobs:
           pip install pytz
           pip install google-generativeai
           pip install sendgrid
+          pip install python-dateutil
+          pip install requests
 
       - name: Run news script
         env:
