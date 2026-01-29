@@ -3,7 +3,7 @@ name: Taiwan Stock News Daily
 on:
   schedule:
     # 毎日 台湾時間 08:00（UTC 23:00）
-    - cron: '0 23 * * *'
+    # cron: '0 23 * * *'
   workflow_dispatch:
 
 jobs:
